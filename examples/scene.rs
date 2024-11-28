@@ -4,19 +4,31 @@ use bevy::{
     app::Startup,
     asset::AssetServer,
     math::Vec3,
-    prelude::{App, Camera3d, Commands, Res, Transform},
-    scene::{SceneBundle, SceneRoot},
-    utils::default,
+    prelude::{
+        App, Camera3d, Commands, Component, ReflectComponent, ReflectDefault, ReflectDeserialize,
+        Res, Transform,
+    },
+    reflect::Reflect,
+    scene::SceneRoot,
     DefaultPlugins,
 };
 use bevy_glxf_loader::GlxfPlugin;
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, Component, Reflect, Serialize, Deserialize)]
+#[reflect(Component, Deserialize, Default)]
+struct MyComponent {
+    foo: String,
+    bar: i32,
+}
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(GlxfPlugin)
         .add_plugins(WorldInspectorPlugin::new())
+        .register_type::<MyComponent>()
         .add_systems(Startup, setup)
         .run();
 }

@@ -33,7 +33,15 @@
         },
         {
             "name": "Disk",
-            "asset": 1
+            "asset": 1,
+            "extensions": {
+                "BEVY_components": {
+                    "scene::MyComponent": {
+                        "foo": "Hello world",
+                        "bar": 123
+                    }
+                }
+            }
         },
         {
             "name": "Subscene",

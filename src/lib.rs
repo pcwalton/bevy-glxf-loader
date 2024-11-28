@@ -3,19 +3,17 @@
 use crate::glxf::{Asset as GlxfAsset, AssetHeader, AssetTransform, Glxf as GlxfGlxf};
 use bevy::{
     app::Plugin,
-    asset::{
-        io::Reader, Asset, AssetApp, AssetLoader, AsyncReadExt, Handle, LoadContext,
-        LoadDirectError,
-    },
+    asset::{io::Reader, Asset, AssetApp, AssetLoader, Handle, LoadContext, LoadDirectError},
     core::Name,
     gltf::Gltf,
     log::{error, warn},
     math::{Mat4, Quat, Vec3},
     prelude::{
-        App, BuildChildren, Component, Deref, DerefMut, Entity, SpatialBundle, Transform, World,
+        App, AppTypeRegistry, BuildChildren, Component, Deref, DerefMut, Entity, FromWorld,
+        ReflectComponent, Transform, Visibility, World,
     },
-    reflect::Reflect,
-    scene::{Scene, SceneRoot, SceneSpawner},
+    reflect::{Reflect, ReflectDeserialize},
+    scene::{Scene, SceneRoot},
     utils::{default, HashMap},
 };
 use serde_json::Error as JsonError;
@@ -26,8 +24,10 @@ pub mod glxf;
 
 pub struct GlxfPlugin;
 
-#[derive(Clone, Default)]
-pub struct GlxfLoader;
+#[derive(Clone)]
+pub struct GlxfLoader {
+    type_registry: AppTypeRegistry,
+}
 
 #[derive(Component, Reflect, Deref, DerefMut)]
 pub struct GlxfScene(pub Handle<Glxf>);
@@ -46,6 +46,7 @@ pub enum GlxfLoadError {
 
 struct GlxfSpawner<'a> {
     world: World,
+    type_registry: AppTypeRegistry,
     node_index_to_entity: HashMap<u32, Entity>,
     scene_index: u32,
     glxf: &'a GlxfGlxf,
@@ -131,7 +132,13 @@ impl AssetLoader for GlxfLoader {
         let mut named_scenes = HashMap::new();
         let mut scenes = vec![];
         for (glxf_scene_index, glxf_scene) in glxf.scenes.iter().enumerate() {
-            let scene = GlxfSpawner::new(&glxf, &assets[..], glxf_scene_index as u32).spawn()?;
+            let scene = GlxfSpawner::new(
+                &glxf,
+                self.type_registry.clone(),
+                &assets[..],
+                glxf_scene_index as u32,
+            )
+            .spawn()?;
 
             let scene_handle =
                 load_context.add_labeled_asset(format!("Scene{}", glxf_scene_index), scene);
@@ -158,9 +165,15 @@ impl AssetLoader for GlxfLoader {
 }
 
 impl<'a> GlxfSpawner<'a> {
-    fn new(glxf: &'a GlxfGlxf, assets: &'a [LoadedGlxfAsset], scene_index: u32) -> GlxfSpawner<'a> {
+    fn new(
+        glxf: &'a GlxfGlxf,
+        type_registry: AppTypeRegistry,
+        assets: &'a [LoadedGlxfAsset],
+        scene_index: u32,
+    ) -> GlxfSpawner<'a> {
         GlxfSpawner {
             world: default(),
+            type_registry,
             node_index_to_entity: default(),
             scene_index,
             glxf,
@@ -214,10 +227,7 @@ impl<'a> GlxfSpawner<'a> {
             }
         };
 
-        new_entity.insert(SpatialBundle {
-            transform,
-            ..default()
-        });
+        new_entity.insert(transform).insert(Visibility::Inherited);
 
         // Add the name component.
         if let Some(ref name) = node.name {
@@ -266,9 +276,61 @@ impl<'a> GlxfSpawner<'a> {
             };
         }
 
-        let new_entity = new_entity.id();
+        // Add custom components, via the `BEVY_components` extension.
+        if let Some(components_value) = node.extensions.get("BEVY_components") {
+            match components_value.as_object() {
+                None => {
+                    error!("`BEVY_components` must be an object");
+                }
+                Some(components_object) => {
+                    let type_registry = self.type_registry.read();
+                    for (type_path, component_value) in components_object.iter() {
+                        match type_registry.get_with_type_path(type_path) {
+                            None => {
+                                warn!("`{}` is not a registered type", type_path);
+                            }
+                            Some(type_registration) => {
+                                match type_registration.data::<ReflectDeserialize>() {
+                                    None => {
+                                        warn!("`{}` has no `ReflectDeserialize` data", type_path);
+                                    }
+                                    Some(reflect_deserialize) => {
+                                        match reflect_deserialize.deserialize(component_value) {
+                                            Err(error) => {
+                                                error!(
+                                                    "Failed to deserialize instance of `{}`: {:?}",
+                                                    type_path, error
+                                                );
+                                            }
+                                            Ok(component) => {
+                                                match type_registration.data::<ReflectComponent>() {
+                                                    None => {
+                                                        warn!(
+                                                            "`{}` has no `ReflectComponent` data",
+                                                            type_path
+                                                        );
+                                                    }
+                                                    Some(reflect_component) => {
+                                                        reflect_component.insert(
+                                                            &mut new_entity,
+                                                            component.as_partial_reflect(),
+                                                            &type_registry,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Add children.
+        let new_entity = new_entity.id();
         if let Some(ref children) = node.children {
             for &kid in children {
                 self.load_node(kid)?;
@@ -280,5 +342,13 @@ impl<'a> GlxfSpawner<'a> {
 
         self.node_index_to_entity.insert(node_index, new_entity);
         Ok(())
+    }
+}
+
+impl FromWorld for GlxfLoader {
+    fn from_world(world: &mut World) -> Self {
+        GlxfLoader {
+            type_registry: world.resource::<AppTypeRegistry>().clone(),
+        }
     }
 }
