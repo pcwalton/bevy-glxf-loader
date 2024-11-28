@@ -17,7 +17,7 @@ use bevy::{
     utils::{default, HashMap},
 };
 use serde_json::Error as JsonError;
-use std::io::Error as IoError;
+use std::{io::Error as IoError, path::Path};
 use thiserror::Error;
 
 pub mod glxf;
@@ -100,13 +100,21 @@ impl AssetLoader for GlxfLoader {
         let mut assets = vec![];
         for (asset_index, asset) in glxf.assets.iter().enumerate() {
             let label = format!("Asset{}", asset_index);
+
+            let mut asset_path = Path::new(&asset.uri).to_owned();
+            if asset_path.is_relative() {
+                if let Some(parent_path) = load_context.path().parent() {
+                    asset_path = parent_path.join(asset_path);
+                }
+            }
+
             let direct_loader = load_context.loader().immediate();
 
             // FIXME(pcwalton): Do better!
             let lowercase_uri = asset.uri.to_ascii_lowercase();
             if lowercase_uri.ends_with("gltf") || lowercase_uri.ends_with("glb") {
                 let gltf = direct_loader
-                    .load::<Gltf>(asset.uri.clone())
+                    .load::<Gltf>(asset_path)
                     .await
                     .map_err(Box::new)?;
                 let gltf_ref = gltf.get();
@@ -117,7 +125,7 @@ impl AssetLoader for GlxfLoader {
                 load_context.add_loaded_labeled_asset(label, gltf);
             } else {
                 let glxf = direct_loader
-                    .load::<Glxf>(asset.uri.clone())
+                    .load::<Glxf>(asset_path)
                     .await
                     .map_err(Box::new)?;
                 let glxf_ref = glxf.get();
