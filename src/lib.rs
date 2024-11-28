@@ -34,11 +34,11 @@ pub struct GlxfScene(pub Handle<Glxf>);
 
 #[derive(Error, Debug)]
 pub enum GlxfLoadError {
-    #[error("I/O")]
+    #[error("An I/O error occurred: {0}")]
     Io(#[from] IoError),
-    #[error("Parsing")]
+    #[error("Parse failed: {0}")]
     Parse(#[from] JsonError),
-    #[error("Loading an asset")]
+    #[error("Asset loading failed: {0}")]
     AssetLoad(#[from] Box<LoadDirectError>),
     #[error("No node was present: {0}")]
     NoNodePresent(u32),
