@@ -9,13 +9,17 @@ use bevy::{
     log::{error, warn},
     math::{Mat4, Quat, Vec3},
     prelude::{
-        App, AppTypeRegistry, BuildChildren, Component, Deref, DerefMut, Entity, FromWorld,
-        ReflectComponent, Transform, Visibility, World,
+        App, AppTypeRegistry, BuildChildren, Component, Deref, DerefMut, Entity, EntityWorldMut,
+        FromWorld, ReflectComponent, Transform, Visibility, World,
     },
-    reflect::{Reflect, ReflectDeserialize},
+    reflect::{
+        serde::TypedReflectDeserializer, PartialReflect, Reflect, ReflectDeserialize,
+        TypeRegistration, TypeRegistry,
+    },
     scene::{Scene, SceneRoot},
     utils::{default, HashMap},
 };
+use serde::de::DeserializeSeed as _;
 use serde_json::Error as JsonError;
 use std::{io::Error as IoError, path::Path};
 use thiserror::Error;
@@ -300,8 +304,36 @@ impl<'a> GlxfSpawner<'a> {
                             Some(type_registration) => {
                                 match type_registration.data::<ReflectDeserialize>() {
                                     None => {
-                                        warn!("`{}` has no `ReflectDeserialize` data", type_path);
+                                        // If there's no `ReflectDeserialize`,
+                                        // try deserializing it using
+                                        // `TypedReflectDeserializer`.
+                                        let typed_reflect_deserializer =
+                                            TypedReflectDeserializer::new(
+                                                type_registration,
+                                                &type_registry,
+                                            );
+                                        match typed_reflect_deserializer
+                                            .deserialize(component_value)
+                                        {
+                                            Err(error) => {
+                                                error!(
+                                                    "Failed to deserialize instance of `{}` using \
+                                                     reflection: {:?}",
+                                                    type_path, error
+                                                );
+                                            }
+                                            Ok(component) => {
+                                                add_component_to_entity(
+                                                    &*component,
+                                                    &mut new_entity,
+                                                    type_registration,
+                                                    &type_registry,
+                                                    type_path,
+                                                );
+                                            }
+                                        }
                                     }
+
                                     Some(reflect_deserialize) => {
                                         match reflect_deserialize.deserialize(component_value) {
                                             Err(error) => {
@@ -311,21 +343,13 @@ impl<'a> GlxfSpawner<'a> {
                                                 );
                                             }
                                             Ok(component) => {
-                                                match type_registration.data::<ReflectComponent>() {
-                                                    None => {
-                                                        warn!(
-                                                            "`{}` has no `ReflectComponent` data",
-                                                            type_path
-                                                        );
-                                                    }
-                                                    Some(reflect_component) => {
-                                                        reflect_component.insert(
-                                                            &mut new_entity,
-                                                            component.as_partial_reflect(),
-                                                            &type_registry,
-                                                        );
-                                                    }
-                                                }
+                                                add_component_to_entity(
+                                                    component.as_partial_reflect(),
+                                                    &mut new_entity,
+                                                    type_registration,
+                                                    &type_registry,
+                                                    type_path,
+                                                );
                                             }
                                         }
                                     }
@@ -350,6 +374,23 @@ impl<'a> GlxfSpawner<'a> {
 
         self.node_index_to_entity.insert(node_index, new_entity);
         Ok(())
+    }
+}
+
+fn add_component_to_entity(
+    component: &dyn PartialReflect,
+    new_entity: &mut EntityWorldMut,
+    type_registration: &TypeRegistration,
+    type_registry: &TypeRegistry,
+    type_path: &str,
+) {
+    match type_registration.data::<ReflectComponent>() {
+        None => {
+            warn!("`{}` has no `ReflectComponent` data", type_path);
+        }
+        Some(reflect_component) => {
+            reflect_component.insert(new_entity, component.as_partial_reflect(), type_registry);
+        }
     }
 }
 
