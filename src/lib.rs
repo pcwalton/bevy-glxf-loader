@@ -1,27 +1,38 @@
 //! A simple loader for glXF files.
 
-use crate::glxf::{Asset as GlxfAsset, AssetHeader, AssetTransform, Glxf as GlxfGlxf};
+use crate::glxf::{Asset as GlxfAsset, AssetHeader, AssetTransform, Glxf as GlxfGlxf, Node};
 use bevy::{
     app::Plugin,
-    asset::{io::Reader, Asset, AssetApp, AssetLoader, Handle, LoadContext, LoadDirectError},
+    asset::{
+        io::Reader, Asset, AssetApp, AssetLoader, Handle, LoadContext, LoadDirectError,
+        UntypedHandle,
+    },
     core::Name,
     gltf::Gltf,
     log::{error, warn},
     math::{Mat4, Quat, Vec3},
     prelude::{
         App, AppTypeRegistry, BuildChildren, Component, Deref, DerefMut, Entity, EntityWorldMut,
-        FromWorld, ReflectComponent, Transform, Visibility, World,
+        FromWorld, ReflectComponent, ReflectDefault, Transform, Visibility, World,
     },
     reflect::{
-        serde::TypedReflectDeserializer, PartialReflect, Reflect, ReflectDeserialize,
-        TypeRegistration, TypeRegistry,
+        serde::{ReflectDeserializerProcessor, TypedReflectDeserializer},
+        DynamicEnum, DynamicTuple, DynamicVariant, GenericInfo, PartialReflect, Reflect,
+        ReflectDeserialize, TypeRegistration, TypeRegistry,
     },
     scene::{Scene, SceneRoot},
     utils::{default, HashMap},
 };
-use serde::de::DeserializeSeed as _;
+use serde::{
+    de::{DeserializeSeed as _, Error as DeserializeError, Visitor},
+    Deserializer,
+};
 use serde_json::Error as JsonError;
-use std::{io::Error as IoError, path::Path};
+use std::{
+    fmt::{Formatter, Result as FmtResult},
+    io::Error as IoError,
+    path::{Path, PathBuf},
+};
 use thiserror::Error;
 
 pub mod glxf;
@@ -55,6 +66,10 @@ struct GlxfSpawner<'a> {
     scene_index: u32,
     glxf: &'a GlxfGlxf,
     assets: &'a [LoadedGlxfAsset],
+}
+
+struct GlxfReflectDeserializer<'a, 'lc> {
+    load_context: &'a mut LoadContext<'lc>,
 }
 
 #[derive(Asset, Reflect, Clone, Default)]
@@ -105,12 +120,7 @@ impl AssetLoader for GlxfLoader {
         for (asset_index, asset) in glxf.assets.iter().enumerate() {
             let label = format!("Asset{}", asset_index);
 
-            let mut asset_path = Path::new(&asset.uri).to_owned();
-            if asset_path.is_relative() {
-                if let Some(parent_path) = load_context.path().parent() {
-                    asset_path = parent_path.join(asset_path);
-                }
-            }
+            let asset_path = relative_path_to_asset_path(&asset.uri, load_context);
 
             let direct_loader = load_context.loader().immediate();
 
@@ -150,7 +160,7 @@ impl AssetLoader for GlxfLoader {
                 &assets[..],
                 glxf_scene_index as u32,
             )
-            .spawn()?;
+            .spawn(load_context)?;
 
             let scene_handle =
                 load_context.add_labeled_asset(format!("Scene{}", glxf_scene_index), scene);
@@ -193,17 +203,21 @@ impl<'a> GlxfSpawner<'a> {
         }
     }
 
-    fn spawn(mut self) -> Result<Scene, GlxfLoadError> {
+    fn spawn(mut self, load_context: &mut LoadContext<'_>) -> Result<Scene, GlxfLoadError> {
         if let Some(root_node_indices) = &self.glxf.scenes[self.scene_index as usize].nodes {
             for root_node_index in root_node_indices {
-                self.load_node(*root_node_index)?;
+                self.load_node(load_context, *root_node_index)?;
             }
         }
 
         Ok(Scene::new(self.world))
     }
 
-    fn load_node(&mut self, node_index: u32) -> Result<(), GlxfLoadError> {
+    fn load_node(
+        &mut self,
+        load_context: &mut LoadContext<'_>,
+        node_index: u32,
+    ) -> Result<(), GlxfLoadError> {
         if self.node_index_to_entity.contains_key(&node_index) {
             // Nothing to do.
             return Ok(());
@@ -289,83 +303,13 @@ impl<'a> GlxfSpawner<'a> {
         }
 
         // Add custom components, via the `BEVY_components` extension.
-        if let Some(components_value) = node.extensions.get("BEVY_components") {
-            match components_value.as_object() {
-                None => {
-                    error!("`BEVY_components` must be an object");
-                }
-                Some(components_object) => {
-                    let type_registry = self.type_registry.read();
-                    for (type_path, component_value) in components_object.iter() {
-                        match type_registry.get_with_type_path(type_path) {
-                            None => {
-                                warn!("`{}` is not a registered type", type_path);
-                            }
-                            Some(type_registration) => {
-                                match type_registration.data::<ReflectDeserialize>() {
-                                    None => {
-                                        // If there's no `ReflectDeserialize`,
-                                        // try deserializing it using
-                                        // `TypedReflectDeserializer`.
-                                        let typed_reflect_deserializer =
-                                            TypedReflectDeserializer::new(
-                                                type_registration,
-                                                &type_registry,
-                                            );
-                                        match typed_reflect_deserializer
-                                            .deserialize(component_value)
-                                        {
-                                            Err(error) => {
-                                                error!(
-                                                    "Failed to deserialize instance of `{}` using \
-                                                     reflection: {:?}",
-                                                    type_path, error
-                                                );
-                                            }
-                                            Ok(component) => {
-                                                add_component_to_entity(
-                                                    &*component,
-                                                    &mut new_entity,
-                                                    type_registration,
-                                                    &type_registry,
-                                                    type_path,
-                                                );
-                                            }
-                                        }
-                                    }
-
-                                    Some(reflect_deserialize) => {
-                                        match reflect_deserialize.deserialize(component_value) {
-                                            Err(error) => {
-                                                error!(
-                                                    "Failed to deserialize instance of `{}`: {:?}",
-                                                    type_path, error
-                                                );
-                                            }
-                                            Ok(component) => {
-                                                add_component_to_entity(
-                                                    component.as_partial_reflect(),
-                                                    &mut new_entity,
-                                                    type_registration,
-                                                    &type_registry,
-                                                    type_path,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        add_custom_components(&mut new_entity, node, &self.type_registry, load_context);
 
         // Add children.
         let new_entity = new_entity.id();
         if let Some(ref children) = node.children {
             for &kid in children {
-                self.load_node(kid)?;
+                self.load_node(load_context, kid)?;
                 if let Some(kid) = self.node_index_to_entity.get(&kid) {
                     self.world.entity_mut(new_entity).add_child(*kid);
                 }
@@ -374,6 +318,170 @@ impl<'a> GlxfSpawner<'a> {
 
         self.node_index_to_entity.insert(node_index, new_entity);
         Ok(())
+    }
+}
+
+fn add_custom_components(
+    new_entity: &mut EntityWorldMut,
+    node: &Node,
+    type_registry: &AppTypeRegistry,
+    load_context: &mut LoadContext<'_>,
+) {
+    let Some(components_value) = node.extensions.get("BEVY_components") else {
+        return;
+    };
+
+    let Some(components_object) = components_value.as_object() else {
+        error!("`BEVY_components` must be an object");
+        return;
+    };
+
+    let type_registry = type_registry.read();
+    for (type_path, component_value) in components_object.iter() {
+        let Some(type_registration) = type_registry.get_with_type_path(type_path) else {
+            warn!("`{}` is not a registered type", type_path);
+            continue;
+        };
+
+        match type_registration.data::<ReflectDeserialize>() {
+            None => {
+                // If there's no `ReflectDeserialize`,
+                // try deserializing it using
+                // `TypedReflectDeserializer`.
+                let mut reflect_deserializer = GlxfReflectDeserializer::new(load_context);
+                let typed_reflect_deserializer = TypedReflectDeserializer::with_processor(
+                    type_registration,
+                    &type_registry,
+                    &mut reflect_deserializer,
+                );
+                match typed_reflect_deserializer.deserialize(component_value) {
+                    Err(error) => {
+                        error!(
+                            "Failed to deserialize instance of `{}` using \
+                             reflection: {:?}",
+                            type_path, error
+                        );
+                    }
+                    Ok(component) => {
+                        add_component_to_entity(
+                            &*component,
+                            new_entity,
+                            type_registration,
+                            &type_registry,
+                            type_path,
+                        );
+                    }
+                }
+            }
+
+            Some(reflect_deserialize) => match reflect_deserialize.deserialize(component_value) {
+                Err(error) => {
+                    error!(
+                        "Failed to deserialize instance of `{}`: {:?}",
+                        type_path, error
+                    );
+                }
+                Ok(component) => {
+                    add_component_to_entity(
+                        component.as_partial_reflect(),
+                        new_entity,
+                        type_registration,
+                        &type_registry,
+                        type_path,
+                    );
+                }
+            },
+        }
+    }
+}
+
+impl<'a, 'lc> GlxfReflectDeserializer<'a, 'lc> {
+    fn new(load_context: &'a mut LoadContext<'lc>) -> GlxfReflectDeserializer<'a, 'lc> {
+        GlxfReflectDeserializer { load_context }
+    }
+}
+
+impl<'a, 'lc> ReflectDeserializerProcessor for GlxfReflectDeserializer<'a, 'lc> {
+    fn try_deserialize<'de, D>(
+        &mut self,
+        registration: &TypeRegistration,
+        _: &TypeRegistry,
+        deserializer: D,
+    ) -> Result<Result<Box<dyn PartialReflect>, D>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let type_info = registration.type_info();
+        let type_path = type_info.type_path_table();
+        if type_path.module_path() != Some("bevy_asset::handle")
+            || type_path.ident() != Some("Handle")
+        {
+            return Ok(Err(deserializer));
+        }
+        let generics = type_info.generics();
+        let GenericInfo::Type(ref asset_type) = &generics[0] else {
+            error!("Handle didn't have a generic type parameter, why?");
+            return Ok(Err(deserializer));
+        };
+
+        let Some(reflect_default) = registration.data::<ReflectDefault>() else {
+            error!("Handle didn't have a `ReflectDefault` implementation, why?");
+            return Ok(Err(deserializer));
+        };
+
+        let relative_path = match deserializer.deserialize_str(&*self) {
+            Ok(path) => path,
+            Err(error) => {
+                error!(
+                    "Failed to deserialize `{}`: {:?}",
+                    type_info.type_path(),
+                    error
+                );
+                return Err(error);
+            }
+        };
+
+        let stem_pos = relative_path.find('#').unwrap_or(relative_path.len());
+        let stem = relative_path_to_asset_path(&relative_path[0..stem_pos], self.load_context);
+        let mut path = stem.to_string_lossy().into_owned();
+        path.push_str(&relative_path[stem_pos..]);
+
+        let untyped_handle = self
+            .load_context
+            .loader()
+            .with_dynamic_type(asset_type.type_id())
+            .load(path);
+
+        let mut typed_handle = reflect_default.default();
+        match untyped_handle {
+            UntypedHandle::Strong(strong_handle) => {
+                let mut tuple = DynamicTuple::default();
+                tuple.insert(strong_handle);
+                let new_typed_handle_enum =
+                    DynamicEnum::new("Strong", DynamicVariant::Tuple(tuple));
+                typed_handle.apply(&new_typed_handle_enum);
+            }
+            UntypedHandle::Weak(_) => {
+                panic!("`load()` should never return weak handles");
+            }
+        }
+
+        Ok(Ok(typed_handle.into_partial_reflect()))
+    }
+}
+
+impl<'a, 'lc, 'de> Visitor<'de> for &'a GlxfReflectDeserializer<'a, 'lc> {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut Formatter) -> FmtResult {
+        write!(formatter, "a string")
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: DeserializeError,
+    {
+        Ok(v.to_owned())
     }
 }
 
@@ -400,4 +508,14 @@ impl FromWorld for GlxfLoader {
             type_registry: world.resource::<AppTypeRegistry>().clone(),
         }
     }
+}
+
+fn relative_path_to_asset_path(asset_path: &str, load_context: &mut LoadContext) -> PathBuf {
+    let mut asset_path = Path::new(asset_path).to_owned();
+    if asset_path.is_relative() {
+        if let Some(parent_path) = load_context.path().parent() {
+            asset_path = parent_path.join(asset_path);
+        }
+    }
+    asset_path
 }
