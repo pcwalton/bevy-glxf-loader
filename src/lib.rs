@@ -4,16 +4,16 @@ use crate::glxf::{Asset as GlxfAsset, AssetHeader, AssetTransform, Glxf as GlxfG
 use bevy::{
     app::Plugin,
     asset::{
-        io::Reader, Asset, AssetApp, AssetLoader, Handle, LoadContext, LoadDirectError,
-        UntypedHandle,
+        io::Reader, Asset, AssetApp, AssetLoader, DuplicateLabelAssetError, Handle, LoadContext,
+        LoadDirectError, UntypedHandle,
     },
-    core::Name,
     gltf::Gltf,
     log::{error, warn},
     math::{Mat4, Quat, Vec3},
+    platform_support::collections::hash_map::HashMap,
     prelude::{
-        App, AppTypeRegistry, BuildChildren, Component, Deref, DerefMut, Entity, EntityWorldMut,
-        FromWorld, ReflectComponent, ReflectDefault, Transform, Visibility, World,
+        App, AppTypeRegistry, Component, Deref, DerefMut, Entity, EntityWorldMut, FromWorld, Name,
+        ReflectComponent, ReflectDefault, Transform, Visibility, World,
     },
     reflect::{
         serde::{ReflectDeserializerProcessor, TypedReflectDeserializer},
@@ -21,7 +21,7 @@ use bevy::{
         ReflectDeserialize, TypeRegistration, TypeRegistry,
     },
     scene::{Scene, SceneRoot},
-    utils::{default, HashMap},
+    utils::default,
 };
 use serde::{
     de::{DeserializeSeed as _, Error as DeserializeError, Visitor},
@@ -57,6 +57,8 @@ pub enum GlxfLoadError {
     AssetLoad(#[from] Box<LoadDirectError>),
     #[error("No node was present: {0}")]
     NoNodePresent(u32),
+    #[error("Duplicate label asset: {0}")]
+    DuplicateLabelAsset(#[from] DuplicateLabelAssetError),
 }
 
 struct GlxfSpawner<'a> {
@@ -79,6 +81,10 @@ pub struct Glxf {
     pub named_scenes: HashMap<Box<str>, Handle<Scene>>,
     pub scenes: Vec<Handle<Scene>>,
     pub default_scene: Option<Handle<Scene>>,
+    /// This keeps dependent glTF assets alive.
+    pub gltf_assets: Vec<Handle<Gltf>>,
+    /// This keeps dependent glXF assets alive.
+    pub glxf_assets: Vec<Handle<Glxf>>,
 }
 
 struct LoadedGlxfAsset {
@@ -117,41 +123,45 @@ impl AssetLoader for GlxfLoader {
         let glxf: GlxfGlxf = serde_json::from_slice(&buffer)?;
 
         let mut assets = vec![];
-        for (asset_index, asset) in glxf.assets.iter().enumerate() {
-            let label = format!("Asset{}", asset_index);
+        let (mut gltf_assets, mut glxf_assets) = (vec![], vec![]);
 
+        for asset in glxf.assets.iter() {
             let asset_path = relative_path_to_asset_path(&asset.uri, load_context);
-
-            let direct_loader = load_context.loader().immediate();
 
             // FIXME(pcwalton): Do better!
             let lowercase_uri = asset.uri.to_ascii_lowercase();
             if lowercase_uri.ends_with("gltf") || lowercase_uri.ends_with("glb") {
+                let label_handle = load_context.load::<Gltf>(asset_path.clone());
+                gltf_assets.push(label_handle);
+
+                let direct_loader = load_context.loader().immediate();
                 let gltf = direct_loader
-                    .load::<Gltf>(asset_path)
+                    .load::<Gltf>(asset_path.clone())
                     .await
                     .map_err(Box::new)?;
-                let gltf_ref = gltf.get();
+                let gltf_ref = gltf.get_asset().get();
                 assets.push(LoadedGlxfAsset {
                     named_scenes: gltf_ref.named_scenes.clone(),
                     default_scene: gltf_ref.default_scene.clone(),
                 });
-                load_context.add_loaded_labeled_asset(label, gltf);
             } else {
+                let label_handle = load_context.load::<Glxf>(asset_path.clone());
+                glxf_assets.push(label_handle);
+
+                let direct_loader = load_context.loader().immediate();
                 let glxf = direct_loader
-                    .load::<Glxf>(asset_path)
+                    .load::<Glxf>(asset_path.clone())
                     .await
                     .map_err(Box::new)?;
-                let glxf_ref = glxf.get();
+                let glxf_ref = glxf.get_asset().get();
                 assets.push(LoadedGlxfAsset {
                     named_scenes: glxf_ref.named_scenes.clone(),
                     default_scene: glxf_ref.default_scene.clone(),
                 });
-                load_context.add_loaded_labeled_asset(label, glxf);
             };
         }
 
-        let mut named_scenes = HashMap::new();
+        let mut named_scenes = HashMap::default();
         let mut scenes = vec![];
         for (glxf_scene_index, glxf_scene) in glxf.scenes.iter().enumerate() {
             let scene = GlxfSpawner::new(
@@ -163,7 +173,7 @@ impl AssetLoader for GlxfLoader {
             .spawn(load_context)?;
 
             let scene_handle =
-                load_context.add_labeled_asset(format!("Scene{}", glxf_scene_index), scene);
+                load_context.add_labeled_asset(format!("Scene{}", glxf_scene_index), scene)?;
 
             if let Some(name) = &glxf_scene.name {
                 named_scenes.insert(name.clone().into_boxed_str(), scene_handle.clone());
@@ -178,6 +188,8 @@ impl AssetLoader for GlxfLoader {
             default_scene: scenes.first().cloned(),
             scenes,
             named_scenes,
+            gltf_assets,
+            glxf_assets,
         })
     }
 
