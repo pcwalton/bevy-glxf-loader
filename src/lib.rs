@@ -90,6 +90,10 @@ struct LoadedGlxfAsset {
     default_scene: Option<Handle<Scene>>,
 }
 
+#[derive(Clone, Component, Reflect, Deref, DerefMut)]
+#[reflect(Component)]
+pub struct GlxfNodeIndex(pub usize);
+
 impl Plugin for GlxfPlugin {
     fn build(&self, app: &mut App) {
         app.register_type::<AssetHeader>()
@@ -97,6 +101,7 @@ impl Plugin for GlxfPlugin {
             .register_type::<Glxf>()
             .register_type::<GlxfAsset>()
             .register_type::<GlxfGlxf>()
+            .register_type::<GlxfNodeIndex>()
             .register_type::<GlxfScene>()
             .init_asset::<Glxf>()
             .init_asset_loader::<GlxfLoader>();
@@ -314,6 +319,9 @@ impl<'a> GlxfSpawner<'a> {
 
         // Add custom components, via the `BEVY_components` extension.
         add_custom_components(&mut new_entity, node, &self.type_registry, load_context);
+
+        // Add the `GlxfNodeIndex`.
+        new_entity.insert(GlxfNodeIndex(node_index as usize));
 
         // Add children.
         let new_entity = new_entity.id();
