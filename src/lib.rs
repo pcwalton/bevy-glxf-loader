@@ -4,8 +4,8 @@ use crate::glxf::{Asset as GlxfAsset, AssetHeader, AssetTransform, Glxf as GlxfG
 use bevy::{
     app::Plugin,
     asset::{
-        io::Reader, Asset, AssetApp, AssetLoader, DuplicateLabelAssetError, Handle, LoadContext,
-        LoadDirectError, UntypedHandle,
+        io::Reader, Asset, AssetApp, AssetLoader, Handle, LoadContext, LoadDirectError,
+        UntypedHandle,
     },
     gltf::Gltf,
     log::{error, warn},
@@ -57,8 +57,6 @@ pub enum GlxfLoadError {
     AssetLoad(#[from] Box<LoadDirectError>),
     #[error("No node was present: {0}")]
     NoNodePresent(u32),
-    #[error("Duplicate label asset: {0}")]
-    DuplicateLabelAsset(#[from] DuplicateLabelAssetError),
 }
 
 struct GlxfSpawner<'a> {
@@ -139,7 +137,7 @@ impl AssetLoader for GlxfLoader {
                     .load::<Gltf>(asset_path.clone())
                     .await
                     .map_err(Box::new)?;
-                let gltf_ref = gltf.get_asset().get();
+                let gltf_ref = gltf.get();
                 assets.push(LoadedGlxfAsset {
                     named_scenes: gltf_ref.named_scenes.clone(),
                     default_scene: gltf_ref.default_scene.clone(),
@@ -153,7 +151,7 @@ impl AssetLoader for GlxfLoader {
                     .load::<Glxf>(asset_path.clone())
                     .await
                     .map_err(Box::new)?;
-                let glxf_ref = glxf.get_asset().get();
+                let glxf_ref = glxf.get();
                 assets.push(LoadedGlxfAsset {
                     named_scenes: glxf_ref.named_scenes.clone(),
                     default_scene: glxf_ref.default_scene.clone(),
@@ -173,7 +171,7 @@ impl AssetLoader for GlxfLoader {
             .spawn(load_context)?;
 
             let scene_handle =
-                load_context.add_labeled_asset(format!("Scene{}", glxf_scene_index), scene)?;
+                load_context.add_labeled_asset(format!("Scene{}", glxf_scene_index), scene);
 
             if let Some(name) = &glxf_scene.name {
                 named_scenes.insert(name.clone().into_boxed_str(), scene_handle.clone());
