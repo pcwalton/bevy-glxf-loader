@@ -2,12 +2,15 @@
 
 use crate::glxf::{Asset as GlxfAsset, AssetHeader, AssetTransform, Glxf as GlxfGlxf, Node};
 use bevy::{
-    app::Plugin,
+    app::{Plugin, SpawnScene},
     asset::{
-        io::Reader, Asset, AssetApp, AssetLoader, Handle, LoadContext, LoadDirectError,
-        UntypedHandle,
+        io::Reader, Asset, AssetApp, AssetLoader, AssetPath, AssetServer, Handle, LoadContext,
+        LoadDirectError, ParseAssetPathError, UntypedHandle,
     },
-    gltf::Gltf,
+    ecs::{
+        query::Without,
+        system::{Commands, Query, Res},
+    },
     log::{error, warn},
     math::{Mat4, Quat, Vec3},
     platform_support::collections::hash_map::HashMap,
@@ -65,7 +68,7 @@ struct GlxfSpawner<'a> {
     node_index_to_entity: HashMap<u32, Entity>,
     scene_index: u32,
     glxf: &'a GlxfGlxf,
-    assets: &'a [LoadedGlxfAsset],
+    root_asset_path: AssetPath<'static>,
 }
 
 struct GlxfReflectDeserializer<'a, 'lc> {
@@ -79,20 +82,18 @@ pub struct Glxf {
     pub named_scenes: HashMap<Box<str>, Handle<Scene>>,
     pub scenes: Vec<Handle<Scene>>,
     pub default_scene: Option<Handle<Scene>>,
-    /// This keeps dependent glTF assets alive.
-    pub gltf_assets: Vec<Handle<Gltf>>,
-    /// This keeps dependent glXF assets alive.
-    pub glxf_assets: Vec<Handle<Glxf>>,
-}
-
-struct LoadedGlxfAsset {
-    named_scenes: HashMap<Box<str>, Handle<Scene>>,
-    default_scene: Option<Handle<Scene>>,
 }
 
 #[derive(Clone, Component, Reflect, Deref, DerefMut)]
 #[reflect(Component)]
 pub struct GlxfNodeIndex(pub usize);
+
+#[derive(Clone, Component, Reflect)]
+#[reflect(Component)]
+pub struct GlxfSceneRoot {
+    pub root: AssetPath<'static>,
+    pub asset: GlxfAsset,
+}
 
 impl Plugin for GlxfPlugin {
     fn build(&self, app: &mut App) {
@@ -103,8 +104,10 @@ impl Plugin for GlxfPlugin {
             .register_type::<GlxfGlxf>()
             .register_type::<GlxfNodeIndex>()
             .register_type::<GlxfScene>()
+            .register_type::<GlxfSceneRoot>()
             .init_asset::<Glxf>()
-            .init_asset_loader::<GlxfLoader>();
+            .init_asset_loader::<GlxfLoader>()
+            .add_systems(SpawnScene, spawn_glxf_scenes);
     }
 }
 
@@ -125,64 +128,37 @@ impl AssetLoader for GlxfLoader {
         reader.read_to_end(&mut buffer).await?;
         let glxf: GlxfGlxf = serde_json::from_slice(&buffer)?;
 
-        let mut assets = vec![];
-        let (mut gltf_assets, mut glxf_assets) = (vec![], vec![]);
-
-        for asset in glxf.assets.iter() {
-            let asset_path = relative_path_to_asset_path(&asset.uri, load_context);
-
-            // FIXME(pcwalton): Do better!
-            let lowercase_uri = asset.uri.to_ascii_lowercase();
-            if lowercase_uri.ends_with("gltf") || lowercase_uri.ends_with("glb") {
-                let label_handle = load_context.load::<Gltf>(asset_path.clone());
-                gltf_assets.push(label_handle);
-
-                let direct_loader = load_context.loader().immediate();
-                let gltf = direct_loader
-                    .load::<Gltf>(asset_path.clone())
-                    .await
-                    .map_err(Box::new)?;
-                let gltf_ref = gltf.get();
-                assets.push(LoadedGlxfAsset {
-                    named_scenes: gltf_ref.named_scenes.clone(),
-                    default_scene: gltf_ref.default_scene.clone(),
-                });
-            } else {
-                let label_handle = load_context.load::<Glxf>(asset_path.clone());
-                glxf_assets.push(label_handle);
-
-                let direct_loader = load_context.loader().immediate();
-                let glxf = direct_loader
-                    .load::<Glxf>(asset_path.clone())
-                    .await
-                    .map_err(Box::new)?;
-                let glxf_ref = glxf.get();
-                assets.push(LoadedGlxfAsset {
-                    named_scenes: glxf_ref.named_scenes.clone(),
-                    default_scene: glxf_ref.default_scene.clone(),
-                });
-            };
-        }
-
         let mut named_scenes = HashMap::default();
         let mut scenes = vec![];
-        for (glxf_scene_index, glxf_scene) in glxf.scenes.iter().enumerate() {
-            let scene = GlxfSpawner::new(
-                &glxf,
-                self.type_registry.clone(),
-                &assets[..],
-                glxf_scene_index as u32,
-            )
-            .spawn(load_context)?;
 
-            let scene_handle =
-                load_context.add_labeled_asset(format!("Scene{}", glxf_scene_index), scene);
+        let asset_path = load_context.asset_path();
+        match asset_path.parent() {
+            Some(root_asset_path) => {
+                for (glxf_scene_index, glxf_scene) in glxf.scenes.iter().enumerate() {
+                    let scene = GlxfSpawner::new(
+                        &glxf,
+                        root_asset_path.clone(),
+                        self.type_registry.clone(),
+                        glxf_scene_index as u32,
+                    )
+                    .spawn(load_context)?;
 
-            if let Some(name) = &glxf_scene.name {
-                named_scenes.insert(name.clone().into_boxed_str(), scene_handle.clone());
+                    let scene_handle =
+                        load_context.add_labeled_asset(format!("Scene{}", glxf_scene_index), scene);
+
+                    if let Some(name) = &glxf_scene.name {
+                        named_scenes.insert(name.clone().into_boxed_str(), scene_handle.clone());
+                    }
+
+                    scenes.push(scene_handle);
+                }
             }
-
-            scenes.push(scene_handle);
+            None => {
+                error!(
+                    "glXF at `{}` has no parent asset path. URIs of assets will not load.",
+                    asset_path
+                );
+            }
         }
 
         Ok(Glxf {
@@ -191,8 +167,6 @@ impl AssetLoader for GlxfLoader {
             default_scene: scenes.first().cloned(),
             scenes,
             named_scenes,
-            gltf_assets,
-            glxf_assets,
         })
     }
 
@@ -204,8 +178,8 @@ impl AssetLoader for GlxfLoader {
 impl<'a> GlxfSpawner<'a> {
     fn new(
         glxf: &'a GlxfGlxf,
+        root_asset_path: AssetPath<'static>,
         type_registry: AppTypeRegistry,
-        assets: &'a [LoadedGlxfAsset],
         scene_index: u32,
     ) -> GlxfSpawner<'a> {
         GlxfSpawner {
@@ -214,7 +188,7 @@ impl<'a> GlxfSpawner<'a> {
             node_index_to_entity: default(),
             scene_index,
             glxf,
-            assets,
+            root_asset_path,
         }
     }
 
@@ -282,37 +256,10 @@ impl<'a> GlxfSpawner<'a> {
                     error!("Asset {} doesn't exist", asset_index);
                 }
                 Some(glxf_asset) => {
-                    let loaded_asset = self.assets.get(asset_index as usize);
-                    match loaded_asset {
-                        None => {
-                            error!("Asset {} wasn't loaded", asset_index);
-                        }
-                        Some(loaded_asset) => match glxf_asset.scene {
-                            Some(ref scene_name) => {
-                                match loaded_asset.named_scenes.get(&**scene_name) {
-                                    None => {
-                                        error!(
-                                            "glTF or glXF `{}` doesn't contain a scene named `{}`",
-                                            glxf_asset.uri, scene_name
-                                        );
-                                    }
-                                    Some(scene) => {
-                                        new_entity.insert(SceneRoot((*scene).clone()));
-                                    }
-                                }
-                            }
-                            None => match glxf_asset.nodes {
-                                Some(_) => {
-                                    warn!("`nodes` glXF asset property not implemented yet");
-                                }
-                                None => {
-                                    if let Some(ref default_scene) = loaded_asset.default_scene {
-                                        new_entity.insert(SceneRoot((*default_scene).clone()));
-                                    }
-                                }
-                            },
-                        },
-                    }
+                    new_entity.insert(GlxfSceneRoot {
+                        asset: glxf_asset.clone(),
+                        root: self.root_asset_path.clone(),
+                    });
                 }
             };
         }
@@ -419,7 +366,7 @@ impl<'a, 'lc> GlxfReflectDeserializer<'a, 'lc> {
     }
 }
 
-impl<'a, 'lc> ReflectDeserializerProcessor for GlxfReflectDeserializer<'a, 'lc> {
+impl ReflectDeserializerProcessor for GlxfReflectDeserializer<'_, '_> {
     fn try_deserialize<'de, D>(
         &mut self,
         registration: &TypeRegistration,
@@ -488,7 +435,7 @@ impl<'a, 'lc> ReflectDeserializerProcessor for GlxfReflectDeserializer<'a, 'lc> 
     }
 }
 
-impl<'a, 'lc, 'de> Visitor<'de> for &'a GlxfReflectDeserializer<'a, 'lc> {
+impl<'a> Visitor<'_> for &'a GlxfReflectDeserializer<'a, '_> {
     type Value = String;
 
     fn expecting(&self, formatter: &mut Formatter) -> FmtResult {
@@ -536,4 +483,31 @@ fn relative_path_to_asset_path(asset_path: &str, load_context: &mut LoadContext)
         }
     }
     asset_path
+}
+
+fn spawn_glxf_scenes(
+    mut commands: Commands,
+    q_glxf_scene_roots: Query<(Entity, &GlxfSceneRoot), Without<SceneRoot>>,
+    asset_server: Res<AssetServer>,
+) {
+    for (entity, glxf_scene_root) in &q_glxf_scene_roots {
+        if let Ok(asset_path) = glxf_scene_root.as_asset_path() {
+            let asset_path_str = asset_path.to_string();
+            let scene: Handle<Scene> = asset_server.load(&asset_path_str);
+            commands.entity(entity).insert(SceneRoot(scene));
+        }
+    }
+}
+
+impl GlxfSceneRoot {
+    fn as_asset_path(&self) -> Result<AssetPath<'static>, ParseAssetPathError> {
+        let mut path = self.asset.uri.clone();
+        path.push('#');
+        match self.asset.scene {
+            Some(ref scene) => path.push_str(scene),
+            None => path.push_str("Scene0"),
+        }
+
+        self.root.resolve(&path)
+    }
 }
