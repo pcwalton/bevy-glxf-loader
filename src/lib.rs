@@ -13,7 +13,7 @@ use bevy::{
     },
     log::{error, warn},
     math::{Mat4, Quat, Vec3},
-    platform_support::collections::hash_map::HashMap,
+    platform::collections::hash_map::HashMap,
     prelude::{
         App, AppTypeRegistry, Component, Deref, DerefMut, Entity, EntityWorldMut, FromWorld, Name,
         ReflectComponent, ReflectDefault, Transform, Visibility, World,
