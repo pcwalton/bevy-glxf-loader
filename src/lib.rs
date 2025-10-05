@@ -426,7 +426,7 @@ impl ReflectDeserializerProcessor for GlxfReflectDeserializer<'_, '_> {
                     DynamicEnum::new("Strong", DynamicVariant::Tuple(tuple));
                 typed_handle.apply(&new_typed_handle_enum);
             }
-            UntypedHandle::Weak(_) => {
+            UntypedHandle::Uuid { .. } => {
                 panic!("`load()` should never return weak handles");
             }
         }
