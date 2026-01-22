@@ -21,7 +21,7 @@ use bevy::{
     reflect::{
         serde::{ReflectDeserializerProcessor, TypedReflectDeserializer},
         DynamicEnum, DynamicTuple, DynamicVariant, GenericInfo, PartialReflect, Reflect,
-        ReflectDeserialize, TypeRegistration, TypeRegistry,
+        ReflectDeserialize, TypePath, TypeRegistration, TypeRegistry,
     },
     scene::{Scene, SceneRoot},
     utils::default,
@@ -42,7 +42,7 @@ pub mod glxf;
 
 pub struct GlxfPlugin;
 
-#[derive(Clone)]
+#[derive(Clone, TypePath)]
 pub struct GlxfLoader {
     type_registry: AppTypeRegistry,
 }
@@ -131,7 +131,7 @@ impl AssetLoader for GlxfLoader {
         let mut named_scenes = HashMap::default();
         let mut scenes = vec![];
 
-        let asset_path = load_context.asset_path();
+        let asset_path = load_context.path();
         match asset_path.parent() {
             Some(root_asset_path) => {
                 for (glxf_scene_index, glxf_scene) in glxf.scenes.iter().enumerate() {
@@ -478,7 +478,7 @@ impl FromWorld for GlxfLoader {
 fn relative_path_to_asset_path(asset_path: &str, load_context: &mut LoadContext) -> PathBuf {
     let mut asset_path = Path::new(asset_path).to_owned();
     if asset_path.is_relative() {
-        if let Some(parent_path) = load_context.path().parent() {
+        if let Some(parent_path) = load_context.path().path().parent() {
             asset_path = parent_path.join(asset_path);
         }
     }
